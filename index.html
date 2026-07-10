@@ -174,7 +174,7 @@
   @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
   .field{margin-bottom:14px}
   label{display:block;font-size:13.5px;font-weight:600;color:var(--green-deep);margin-bottom:6px}
-  label .req{color:var(--red)}
+  label .opt{color:var(--muted);font-weight:500}
   input,textarea{
     width:100%;font-family:inherit;font-size:16px;color:var(--ink);
     background:#fff;border:1px solid var(--paper-line);border-radius:10px;
@@ -254,7 +254,7 @@
   <section class="studio" id="studio">
     <div class="onair">
       <span class="lamp" id="lamp"><span class="bulb"></span> ON AIR</span>
-      <span class="clock"><span id="time">0:00</span><span class="max"> / 2:00</span></span>
+      <span class="clock"><span id="time">0:00</span><span class="max"> / 1:30</span></span>
     </div>
 
     <div class="meter" id="meter"></div>
@@ -281,15 +281,11 @@
   <!-- ============ BIỂU MẪU ============ -->
   <form id="infoForm" autocomplete="on">
     <div class="field">
-      <label>Họ và tên <span class="req">*</span></label>
-      <input type="text" id="fName" placeholder="Nguyễn Văn A" required />
+      <label>Tên bài hát bạn gửi là <span class="opt">(không bắt buộc)</span></label>
+      <input type="text" id="fSong" placeholder="Ví dụ: Phượng Hồng, Mắt Biếc, Nhật Ký Của Mẹ…" />
     </div>
     <div class="field">
-      <label>Lớp ngày xưa <span class="req">*</span></label>
-      <input type="text" id="fClass" placeholder="Ví dụ: 12 Toán, 12A1, 12 Anh…" required />
-    </div>
-    <div class="field">
-      <label>Ghi chú cho ban tổ chức (không bắt buộc)</label>
+      <label>Ghi chú cho ban tổ chức <span class="opt">(không bắt buộc)</span></label>
       <textarea id="fNote" placeholder="Ví dụ: nhờ phát vào buổi khai mạc, hoặc gửi lời chúc riêng đến lớp…"></textarea>
       <div class="hint">Phần này chỉ ban tổ chức đọc, không phát lên loa.</div>
     </div>
@@ -318,17 +314,20 @@
   </footer>
 </div>
 
+<!-- Bộ mã hóa MP3 chạy trong trình duyệt (bundle sẵn, không cần mạng) -->
+<script src="lame.min.js"></script>
 <script>
 /* =======================================================================
    CẤU HÌNH — DÁN URL WEB APP CỦA APPS SCRIPT VÀO ĐÂY (xem README bước 3)
    ======================================================================= */
-const WEB_APP_URL = "https://script.google.com/macros/s/AKfycby67zGbhD0VaEBH72s9S-DOaYpb979JMBdMld7PgZ2B61Y_sQngPPVYOpW082BanV-3Hg/exec";
+const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwvOWdzNpq_4-3Tzo4DNgLtYGL1_fK_ir1FNsqWFx0iarFeB8M3WAtaHQlhPOXjxOSDyg/exec";
 
-const MAX_SECONDS = 120;   // giới hạn 2 phút, tự dừng khi hết giờ
+const MAX_SECONDS = 90;   // giới hạn 90 giây, tự dừng khi hết giờ
 
 /* ---------- Trạng thái ---------- */
-let mediaRecorder, stream, chunks = [], recordedBlob = null, recMime = "";
+let mediaRecorder, stream, chunks = [], recordedBlob = null, recMime = "", recExt = "mp3";
 let audioCtx, analyser, rafId, seconds = 0, timerId = null;
+let recMode = "mp3", source = null, processor = null, mp3enc = null, mp3Data = [];
 
 const $ = id => document.getElementById(id);
 const recBtn=$("recBtn"), lamp=$("lamp"), timeEl=$("time"), meter=$("meter"),
@@ -355,28 +354,42 @@ function extFor(mime){
 }
 function fmt(s){return Math.floor(s/60)+":"+String(s%60).padStart(2,"0");}
 
+/* Có thể encode MP3 trực tiếp không? (cần lamejs + Web Audio) */
+function mp3Supported(){
+  return !!(window.lamejs && (window.AudioContext||window.webkitAudioContext));
+}
+/* Chuyển mẫu Float32 [-1,1] sang Int16 cho lamejs */
+function floatTo16(buf){
+  const out = new Int16Array(buf.length);
+  for(let i=0;i<buf.length;i++){
+    let s = buf[i]; if(s>1)s=1; else if(s<-1)s=-1;
+    out[i] = s<0 ? s*0x8000 : s*0x7FFF;
+  }
+  return out;
+}
+/* Vẽ cột sóng từ analyser */
+function drawMeter(data){
+  const step = ()=>{
+    if(!analyser) return;
+    analyser.getByteFrequencyData(data);
+    for(let i=0;i<BARS;i++) barEls[i].style.height = Math.max(3,((data[i]||0)/255)*70)+"px";
+    rafId = requestAnimationFrame(step);
+  };
+  step();
+}
+
 /* ---------- Bắt đầu ghi ---------- */
 async function startRec(){
   errNote.classList.remove("show");
   try{
-    stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
+    stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
   }catch(err){
-    showErr("Không truy cập được micro. Vui lòng cho phép quyền micro trong trình duyệt rồi thử lại. (Trên iPhone hãy dùng Safari.)");
+    showErr("Không truy cập được micro. Vui lòng cho phép quyền micro rồi thử lại. (Trên iPhone hãy dùng Safari.)");
     return;
   }
 
-  const mime = pickMime();
-  const opts = mime ? {mimeType:mime, audioBitsPerSecond:64000} : {audioBitsPerSecond:64000};
-  try{ mediaRecorder = new MediaRecorder(stream, opts); }
-  catch(e){ mediaRecorder = new MediaRecorder(stream); }
-  recMime = mediaRecorder.mimeType || mime || "audio/webm";
-  chunks = [];
+  if(mp3Supported()) startMp3(); else startFallback();
 
-  mediaRecorder.ondataavailable = e => { if(e.data.size>0) chunks.push(e.data); };
-  mediaRecorder.onstop = finishRec;
-  mediaRecorder.start();
-
-  setupMeter(stream);
   recBtn.classList.add("recording");
   recBtn.setAttribute("aria-label","Dừng ghi âm");
   lamp.classList.add("live");
@@ -391,53 +404,95 @@ async function startRec(){
   },1000);
 }
 
+/* ---- Ghi MP3 trực tiếp: lấy PCM qua Web Audio, encode bằng lamejs theo từng khối ---- */
+function startMp3(){
+  recMode="mp3"; recMime="audio/mpeg"; recExt="mp3"; mp3Data=[];
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  if(audioCtx.state==="suspended") audioCtx.resume();
+
+  const sr = audioCtx.sampleRate;              // 44100 hoặc 48000 — MP3 đều hỗ trợ
+  mp3enc = new lamejs.Mp3Encoder(1, sr, 64);   // 1 kênh (mono), 64 kbps — chuẩn cho giọng nói
+
+  source = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser(); analyser.fftSize = 64;
+  source.connect(analyser);
+
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = e=>{
+    const input = e.inputBuffer.getChannelData(0);
+    const buf = mp3enc.encodeBuffer(floatTo16(input));
+    if(buf.length>0) mp3Data.push(buf);
+  };
+  source.connect(processor);
+  processor.connect(audioCtx.destination);     // output rỗng nên không hú mic
+
+  drawMeter(new Uint8Array(analyser.frequencyBinCount));
+}
+
+/* ---- Dự phòng: máy quá cũ không có lamejs/Web Audio → dùng MediaRecorder (webm/m4a) ---- */
+function startFallback(){
+  recMode="mr";
+  const mime = pickMime();
+  const opts = mime ? {mimeType:mime, audioBitsPerSecond:64000} : {audioBitsPerSecond:64000};
+  try{ mediaRecorder = new MediaRecorder(stream, opts); }
+  catch(e){ mediaRecorder = new MediaRecorder(stream); }
+  recMime = mediaRecorder.mimeType || mime || "audio/webm";
+  recExt  = extFor(recMime);
+  chunks = [];
+  mediaRecorder.ondataavailable = e=>{ if(e.data.size>0) chunks.push(e.data); };
+  mediaRecorder.onstop = ()=>{ recordedBlob=new Blob(chunks,{type:recMime}); showRecorded(); };
+  mediaRecorder.start();
+
+  try{
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    source = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 64;
+    source.connect(analyser);
+    drawMeter(new Uint8Array(analyser.frequencyBinCount));
+  }catch(e){/* không có meter cũng không sao */}
+}
+
 /* ---------- Dừng ghi ---------- */
 function stopRec(){
-  if(mediaRecorder && mediaRecorder.state!=="inactive") mediaRecorder.stop();
   clearInterval(timerId);
   cancelAnimationFrame(rafId);
-  if(audioCtx){ audioCtx.close().catch(()=>{}); audioCtx=null; }
-  if(stream){ stream.getTracks().forEach(t=>t.stop()); }
   recBtn.classList.remove("recording");
   lamp.classList.remove("live");
   barEls.forEach(b=>b.style.height="3px");
+
+  if(recMode==="mp3"){
+    if(processor){ processor.onaudioprocess=null; processor.disconnect(); }
+    if(source) source.disconnect();
+    const tail = mp3enc.flush();               // xả nốt phần cuối
+    if(tail.length>0) mp3Data.push(tail);
+    recordedBlob = new Blob(mp3Data, {type:"audio/mpeg"});
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    if(audioCtx){ audioCtx.close().catch(()=>{}); }
+    analyser=null;
+    showRecorded();
+  }else{
+    if(mediaRecorder && mediaRecorder.state!=="inactive") mediaRecorder.stop(); // → onstop → showRecorded
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    if(audioCtx){ audioCtx.close().catch(()=>{}); }
+    analyser=null;
+  }
 }
 
-/* ---------- Xử lý sau khi dừng ---------- */
-function finishRec(){
-  recordedBlob = new Blob(chunks, {type:recMime});
+/* ---------- Hiển thị sau khi có bản ghi ---------- */
+function showRecorded(){
+  const sizeKB = Math.round(recordedBlob.size/1024);
   player.src = URL.createObjectURL(recordedBlob);
   review.classList.add("show");
   form.classList.add("show");
   studio.classList.add("done");
-  ctrlLabel.innerHTML = "<b>Đã ghi xong "+fmt(seconds)+"</b>Nghe lại bên dưới, rồi điền thông tin để gửi";
+  const kind = recExt==="mp3" ? "MP3" : recExt.toUpperCase();
+  ctrlLabel.innerHTML = "<b>Đã ghi xong "+fmt(seconds)+"</b>"+kind+" · "+sizeKB+" KB · nghe lại rồi bấm gửi (có thể ghi tên bài hát)";
   recBtn.disabled = true;
-}
-
-/* ---------- Sóng âm trực tiếp ---------- */
-function setupMeter(stream){
-  try{
-    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
-    const src = audioCtx.createMediaStreamSource(stream);
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 64;
-    src.connect(analyser);
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    const draw = ()=>{
-      analyser.getByteFrequencyData(data);
-      for(let i=0;i<BARS;i++){
-        const v = data[i] || 0;
-        barEls[i].style.height = Math.max(3, (v/255)*70) + "px";
-      }
-      rafId = requestAnimationFrame(draw);
-    };
-    draw();
-  }catch(e){/* thiết bị không hỗ trợ AudioContext vẫn ghi được bình thường */}
 }
 
 /* ---------- Ghi lại ---------- */
 function redo(){
-  recordedBlob=null;
+  recordedBlob=null; mp3Data=[]; chunks=[];
   recBtn.disabled=false;
   studio.classList.remove("done");
   review.classList.remove("show");
@@ -459,17 +514,16 @@ function showErr(msg){ errNote.textContent=msg; errNote.classList.add("show"); }
 
 async function submit(e){
   e.preventDefault();
-  const name=$("fName").value.trim(), cls=$("fClass").value.trim(), note=$("fNote").value.trim();
+  const song=$("fSong").value.trim(), note=$("fNote").value.trim();
   if(!recordedBlob){ showErr("Bạn chưa ghi âm. Hãy chạm nút đỏ để ghi trước nhé."); return; }
-  if(!name||!cls){ showErr("Vui lòng điền họ tên và lớp."); return; }
   if(WEB_APP_URL.includes("DÁN_URL")){ showErr("Chưa cấu hình đường dẫn gửi dữ liệu (WEB_APP_URL). Báo ban tổ chức nhé."); return; }
 
   submitBtn.classList.add("loading"); submitBtn.disabled=true; errNote.classList.remove("show");
   try{
     const b64 = await blobToBase64(recordedBlob);
     const payload = {
-      name, className:cls, note,
-      mimeType:recMime, ext:extFor(recMime),
+      song, note,
+      mimeType:recMime, ext:recExt,
       durationSec:seconds,
       audioBase64:b64
     };
@@ -505,8 +559,8 @@ redoBtn.addEventListener("click", redo);
 form.addEventListener("submit", submit);
 againBtn.addEventListener("click", ()=>location.reload());
 
-/* Cảnh báo nếu trình duyệt quá cũ */
-if(!navigator.mediaDevices || !window.MediaRecorder){
+/* Cảnh báo nếu trình duyệt quá cũ (không encode MP3 được và cũng không có MediaRecorder) */
+if(!navigator.mediaDevices || (!mp3Supported() && !window.MediaRecorder)){
   ctrlLabel.innerHTML="<b>Trình duyệt không hỗ trợ ghi âm</b>Hãy mở bằng Chrome hoặc Safari mới nhất";
   recBtn.disabled=true;
 }
